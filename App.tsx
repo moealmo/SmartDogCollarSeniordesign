@@ -1,4 +1,7 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
+import { Alert, PermissionsAndroid, Platform } from "react-native";
+import { BleManager, Device, State, Subscription } from "react-native-ble-plx";
+import { decode, encode } from "base-64";
 import {
   SafeAreaView,
   ScrollView,
@@ -36,64 +39,170 @@ export default function App() {
 
   const [dataHistory, setDataHistory] = useState<DataPoint[]>([]);
 
-  // Simulated GPS + activity + timestamp + data recording
+  // BLE UUIDs must match the Arduino sketch.
+  const SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
+  const TX_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"; // Arduino -> phone
+  const RX_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"; // Phone -> Arduino
+  const bleManager = useRef<BleManager | null>(null);
+  const deviceRef = useRef<Device | null>(null);
+  const notifyRef = useRef<Subscription | null>(null);
+  const disconnectRef = useRef<Subscription | null>(null);
+  const scanTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [bleStatus, setBleStatus] = useState("Ready to scan");
+  const [receivedData, setReceivedData] = useState("No data received");
+
   useEffect(() => {
-    if (!connected) {
-      setActivity("Stationary");
-      return;
+    const manager = new BleManager();
+    bleManager.current = manager;
+    return () => {
+      manager.stopDeviceScan();
+      if (scanTimeoutRef.current) clearTimeout(scanTimeoutRef.current);
+      notifyRef.current?.remove();
+      disconnectRef.current?.remove();
+      if (deviceRef.current) manager.cancelDeviceConnection(deviceRef.current.id).catch(() => {});
+      manager.destroy();
+      bleManager.current = null;
+    };
+  }, []);
+
+  const requestPermissions = async () => {
+    if (Platform.OS !== "android") return true;
+    const api = Number(Platform.Version);
+    if (api >= 31) {
+      const result = await PermissionsAndroid.requestMultiple([
+        PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN,
+        PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT,
+      ]);
+      return Object.values(result).every((value) => value === PermissionsAndroid.RESULTS.GRANTED);
     }
+    return (await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION)) ===
+      PermissionsAndroid.RESULTS.GRANTED;
+  };
 
-    const activities = [
-      "Walking",
-      "Walking",
-      "Running",
-      "Stationary",
-    ];
+  const stopScan = () => {
+    bleManager.current?.stopDeviceScan();
+    if (scanTimeoutRef.current) clearTimeout(scanTimeoutRef.current);
+    scanTimeoutRef.current = null;
+  };
 
-    let activityIndex = 0;
+  const processData = (message: string) => {
+    setReceivedData(message);
+    setLastUpdate(new Date().toLocaleTimeString());
+    // Expected test format: BATTERY:85;ACTIVITY:Walking
+    const batteryMatch = message.match(/BATTERY:(\d+)/i);
+    const activityMatch = message.match(/ACTIVITY:([A-Za-z]+)/i);
+    if (batteryMatch) setBattery(Math.min(100, Math.max(0, Number(batteryMatch[1]))));
+    if (activityMatch) setActivity(activityMatch[1]);
+  };
 
-    const interval = setInterval(() => {
-      const newLatitude =
-        latitude + (Math.random() - 0.5) * 0.0002;
-
-      const newLongitude =
-        longitude + (Math.random() - 0.5) * 0.0002;
-
-      setLatitude(newLatitude);
-      setLongitude(newLongitude);
-
-      const newActivity = activities[activityIndex];
-
-      setActivity(newActivity);
-
-      activityIndex =
-        (activityIndex + 1) % activities.length;
-
-      const now = new Date();
-
-      const time = now.toLocaleTimeString();
-
-      setLastUpdate(time);
-
-      // Record GPS + activity + timestamp
-      setDataHistory((previous) => [
-        {
-          time,
-          activity: newActivity,
-          latitude: newLatitude,
-          longitude: newLongitude,
-        },
-        ...previous,
-      ].slice(0, 5));
-
-      // Simulate small battery usage
-      setBattery((previous) =>
-        previous > 20 ? previous - 1 : previous
+  const connectToDevice = async (device: Device) => {
+    const manager = bleManager.current;
+    if (!manager) return;
+    try {
+      setBleStatus("Connecting...");
+      const connectedDevice = await manager.connectToDevice(device.id, { timeout: 10000 });
+      deviceRef.current = connectedDevice;
+      await connectedDevice.discoverAllServicesAndCharacteristics();
+      notifyRef.current?.remove();
+      notifyRef.current = connectedDevice.monitorCharacteristicForService(
+        SERVICE_UUID, TX_UUID, (error, characteristic) => {
+          if (error) {
+            setBleStatus(`Data error: ${error.message}`);
+            return;
+          }
+          if (characteristic?.value) processData(decode(characteristic.value));
+        }
       );
-    }, 4000);
+      disconnectRef.current?.remove();
+      disconnectRef.current = manager.onDeviceDisconnected(device.id, () => {
+        setConnected(false);
+        deviceRef.current = null;
+        notifyRef.current?.remove();
+        notifyRef.current = null;
+        setBleStatus("Collar disconnected");
+      });
+      setConnected(true);
+      setBleStatus(`Connected to ${device.name || "SmartDogCollar"}`);
+    } catch (error) {
+      setConnected(false);
+      deviceRef.current = null;
+      setBleStatus(`Connection failed: ${String(error)}`);
+      Alert.alert("Connection failed", "Check that the collar is powered on and uses the matching BLE service.");
+    } finally {
+      setBusy(false);
+    }
+  };
 
-    return () => clearInterval(interval);
-  }, [connected]);
+  const scanAndConnect = async () => {
+    const manager = bleManager.current;
+    if (!manager || busy) return;
+    setBusy(true);
+    try {
+      if (!(await requestPermissions())) {
+        setBleStatus("Bluetooth permissions denied");
+        setBusy(false);
+        return;
+      }
+      const state = await manager.state();
+      if (state !== State.PoweredOn) {
+        setBleStatus("Turn on Bluetooth and try again");
+        setBusy(false);
+        return;
+      }
+      setBleStatus("Scanning for SmartDogCollar...");
+      manager.startDeviceScan([SERVICE_UUID], null, (error, device) => {
+        if (error) {
+          stopScan();
+          setBleStatus(`Scan failed: ${error.message}`);
+          setBusy(false);
+          return;
+        }
+        if (device && (device.name === "SmartDogCollar" || device.localName === "SmartDogCollar")) {
+          stopScan();
+          void connectToDevice(device);
+        }
+      });
+      scanTimeoutRef.current = setTimeout(() => {
+        stopScan();
+        setBleStatus("Collar not found. Check power and BLE advertising.");
+        setBusy(false);
+      }, 12000);
+    } catch (error) {
+      stopScan();
+      setBleStatus(`Scan error: ${String(error)}`);
+      setBusy(false);
+    }
+  };
+
+  const disconnectCollar = async () => {
+    stopScan();
+    const device = deviceRef.current;
+    notifyRef.current?.remove();
+    notifyRef.current = null;
+    disconnectRef.current?.remove();
+    disconnectRef.current = null;
+    deviceRef.current = null;
+    setConnected(false);
+    setBleStatus("Disconnected");
+    if (device) {
+      try { await bleManager.current?.cancelDeviceConnection(device.id); }
+      catch (error) { setBleStatus(`Disconnect error: ${String(error)}`); }
+    }
+  };
+
+  const sendTestCommand = async () => {
+    const device = deviceRef.current;
+    if (!device || !connected) return;
+    try {
+      await device.writeCharacteristicWithResponseForService(
+        SERVICE_UUID, RX_UUID, encode("PING")
+      );
+      setBleStatus("PING sent. Waiting for collar reply...");
+    } catch (error) {
+      setBleStatus(`Send failed: ${String(error)}`);
+    }
+  };
 
   return (
     <SafeAreaView style={styles.container}>
@@ -129,7 +238,7 @@ export default function App() {
               value={connected ? activity : "Stationary"}
             >
               {connected
-                ? "Activity data is being received"
+                ? "Activity data received from collar"
                 : "Connect the collar to receive activity data"}
             </InfoCard>
 
@@ -148,22 +257,26 @@ export default function App() {
 
               <Text style={styles.description}>
                 {connected
-                  ? "Bluetooth connection is active"
+                  ? "Real BLE connection is active"
                   : "Collar is not connected"}
               </Text>
 
+              <Text style={styles.description}>{bleStatus}</Text>
+              <Text style={styles.smallText}>Received: {receivedData}</Text>
               <Pressable
                 style={styles.connectButton}
-                onPress={() =>
-                  setConnected(!connected)
-                }
+                disabled={busy}
+                onPress={connected ? () => { void disconnectCollar(); } : () => { void scanAndConnect(); }}
               >
                 <Text style={styles.connectButtonText}>
-                  {connected
-                    ? "Disconnect Collar"
-                    : "Connect Collar"}
+                  {busy ? "Connecting..." : connected ? "Disconnect Collar" : "Connect Collar"}
                 </Text>
               </Pressable>
+              {connected && (
+                <Pressable style={styles.connectButton} onPress={() => { void sendTestCommand(); }}>
+                  <Text style={styles.connectButtonText}>Send Test Data (PING)</Text>
+                </Pressable>
+              )}
             </View>
 
             {/* LIVE LOCATION */}
@@ -175,18 +288,18 @@ export default function App() {
 
               <Text style={styles.cardValue}>
                 {connected
-                  ? "🟢 GPS Active"
+                  ? "🟢 GPS Not Configured"
                   : "🔴 GPS Unavailable"}
               </Text>
 
               {connected ? (
                 <>
                   <Text style={styles.smallText}>
-                    Latitude: {latitude.toFixed(6)}
+                    Latitude (placeholder): {latitude.toFixed(6)}
                   </Text>
 
                   <Text style={styles.smallText}>
-                    Longitude: {longitude.toFixed(6)}
+                    Longitude (placeholder): {longitude.toFixed(6)}
                   </Text>
 
                   <Text style={styles.smallText}>
@@ -195,7 +308,7 @@ export default function App() {
                 </>
               ) : (
                 <Text style={styles.description}>
-                  Connect the collar to receive GPS data.
+                  GPS data will be available after the GPS sensor is integrated.
                 </Text>
               )}
             </View>
@@ -210,7 +323,7 @@ export default function App() {
 
             <View style={styles.mapBox}>
               <Text style={styles.mapText}>
-                {connected ? "LIVE GPS" : "GPS OFFLINE"}
+                {connected ? "GPS TEST VIEW" : "GPS OFFLINE"}
               </Text>
 
               <View style={styles.mapRoad1} />
@@ -232,18 +345,18 @@ export default function App() {
 
               <Text style={styles.cardValue}>
                 {connected
-                  ? "🟢 GPS Connected"
+                  ? "🟢 GPS Not Configured"
                   : "🔴 GPS Unavailable"}
               </Text>
 
               {connected ? (
                 <>
                   <Text style={styles.smallText}>
-                    Latitude: {latitude.toFixed(6)}
+                    Latitude (placeholder): {latitude.toFixed(6)}
                   </Text>
 
                   <Text style={styles.smallText}>
-                    Longitude: {longitude.toFixed(6)}
+                    Longitude (placeholder): {longitude.toFixed(6)}
                   </Text>
 
                   <Text style={styles.smallText}>
@@ -251,12 +364,12 @@ export default function App() {
                   </Text>
 
                   <Text style={styles.smallText}>
-                    Status: Receiving location data
+                    Status: GPS sensor not connected yet
                   </Text>
                 </>
               ) : (
                 <Text style={styles.smallText}>
-                  Connect the collar to receive GPS data.
+                  GPS data will be available after the GPS sensor is integrated.
                 </Text>
               )}
             </View>
@@ -354,17 +467,17 @@ export default function App() {
 
               <Text style={styles.smallText}>
                 GPS Position:{" "}
-                {connected ? "Recording" : "Waiting"}
+                {connected ? "BLE connected" : "Waiting"}
               </Text>
 
               <Text style={styles.smallText}>
                 Activity State:{" "}
-                {connected ? "Recording" : "Waiting"}
+                {connected ? "BLE connected" : "Waiting"}
               </Text>
 
               <Text style={styles.smallText}>
                 Timestamp:{" "}
-                {connected ? "Recording" : "Waiting"}
+                {connected ? "BLE connected" : "Waiting"}
               </Text>
 
               <Text style={styles.smallText}>
